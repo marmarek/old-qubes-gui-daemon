@@ -35,6 +35,7 @@ qubes-guid: $(OBJS)
 		`pkg-config --libs vchan-$(BACKEND_VMM)` \
 		`pkg-config --libs libpng` \
 		`pkg-config --libs libconfig` \
-		`pkg-config --libs libnotify`
+		`pkg-config --libs libnotify` \
+		`pkg-config --libs xrandr`
 clean:
 	rm -f qubes-guid *.o *~

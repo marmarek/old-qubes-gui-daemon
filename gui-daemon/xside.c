@@ -24,6 +24,7 @@
  * http://wiki.qubes-os.org/trac/wiki/GUIdocs
  */
 
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -36,12 +37,14 @@
 #include <poll.h>
 #include <errno.h>
 #include <unistd.h>
+#include <spawn.h>
 #include <execinfo.h>
 #include <X11/X.h>
 #include <X11/Xlib.h>
 #include <X11/Intrinsic.h>
 #include <X11/Xutil.h>
 #include <X11/extensions/XShm.h>
+#include <X11/extensions/Xrandr.h>
 #include <X11/Xatom.h>
 #include <libconfig.h>
 #include <libnotify/notify.h>
@@ -120,12 +123,17 @@ struct _global_handles {
 	Window root_win;	/* root attributes */
 	int root_width;		/* size of root window */
 	int root_height;
+	char* remote_monitor_layout;
 	GC context;		/* context for pixmap operations */
 	GC frame_gc;		/* graphic context to paint window frame */
 #ifdef FILL_TRAY_BG
 	GC tray_gc;		/* graphic context to paint tray background */
 #endif
 	/* atoms for comunitating with xserver */
+	int xrandr_major;
+	int xrandr_minor;
+	int xrandr_event_base;
+	int xrandr_error_base;
 	Atom wmDeleteMessage;	/* Atom: WM_DELETE_WINDOW */
 	Atom tray_selection;	/* Atom: _NET_SYSTEM_TRAY_SELECTION_S<creen number> */
 	Atom tray_opcode;	/* Atom: _NET_SYSTEM_TRAY_MESSAGE_OPCODE */
@@ -451,6 +459,14 @@ static void mkghandles(Ghandles * g)
 		perror("XOpenDisplay");
 		exit(1);
 	}
+	if(!XRRQueryExtension(g->display, &g->xrandr_event_base, &g->xrandr_error_base) ||
+		!XRRQueryVersion(g->display, &g->xrandr_major, &g->xrandr_minor) ||
+		g->xrandr_major < 1 || (g->xrandr_major == 1 && g->xrandr_minor < 2)
+		) {
+		fprintf(stderr, "X server must support XRandR 1.2 or later\n");
+		exit(1);
+	}
+
 	g->screen = DefaultScreen(g->display);
 	g->root_win = RootWindow(g->display, g->screen);
 	XGetWindowAttributes(g->display, g->root_win, &attr);
@@ -1136,6 +1152,58 @@ static int force_on_screen(Ghandles * g, struct windowdata *vm_window,
 	return do_move;
 }
 
+
+static int send_set_monitor_layout(Ghandles* g)
+{
+	int err;
+	int status;
+	pid_t pid = -1;
+	int devnull;
+	int stdin_pipe[2] = {-1, -1};
+	posix_spawn_file_actions_t file_actions;
+	char domid_str[16];
+	char* args[] = {"qrexec-client", "-d", domid_str, "DEFAULT:QUBESRPC qubes.SetMonitorLayout dom0", 0};
+
+	snprintf(domid_str, sizeof(domid_str), "%d", g->target_domid);
+
+	fprintf(stderr, "send_set_monitor_layout %s", g->remote_monitor_layout);
+
+	devnull = open("/dev/null", O_RDWR | O_CLOEXEC);
+	if(devnull < 0) {
+		perror("open /dev/null");
+		exit(1);
+	}
+
+	if(pipe2(stdin_pipe, O_CLOEXEC) < 0) {
+		perror("pipe2");
+		exit(1);
+	}
+
+	posix_spawn_file_actions_init(&file_actions);
+	posix_spawn_file_actions_adddup2(&file_actions, stdin_pipe[0], 0);
+	/* prevent an exploited VM sending output and spoofing our log messages */
+	posix_spawn_file_actions_adddup2(&file_actions, devnull, 1);
+	/* leave stderr attached to our stderr */
+
+	err = posix_spawn(&pid, QREXEC_CLIENT_PATH, &file_actions, NULL, &args[0], NULL);
+	if(err) {
+		fprintf(stderr, "posix_spawn qrexec-client: %s\n", strerror(err));
+		exit(1);
+	}
+	close(devnull);
+	close(stdin_pipe[0]);
+
+	write(stdin_pipe[1], g->remote_monitor_layout, strlen(g->remote_monitor_layout));
+	close(stdin_pipe[1]);
+
+	if(waitpid(pid, &status, 0) < 0) {
+		perror("waitpid");
+		exit(1);
+	}
+
+	return WEXITSTATUS(status) == 0;
+}
+
 /* handle local Xserver event: XConfigureEvent
  * after some checks/fixes send to relevant window in VM */
 static void process_xevent_configure(Ghandles * g, const XConfigureEvent * ev)
@@ -1723,7 +1791,56 @@ static void process_xevent_xembed(Ghandles * g, const XClientMessageEvent * ev)
 		k.detail = NotifyNonlinear;
 		write_message(g->vchan, hdr, k);
 	}
+}
 
+static void update_monitor_layout(Ghandles * g) {
+    int i;
+	char* monitor_layout = 0;
+	size_t monitor_layout_size = 0;
+	FILE* monitor_layout_stream;
+	XRRScreenResources* res;
+
+	monitor_layout_stream = open_memstream(&monitor_layout, &monitor_layout_size);
+	res = XRRGetScreenResources (g->display, g->root_win);
+	for(i = 0; i < res->noutput; ++i) {
+		if(res->outputs[i]) {
+			XRROutputInfo* output = XRRGetOutputInfo (g->display, res, res->outputs[i]);
+			if(output) {
+				if(output->crtc) {
+					XRRCrtcInfo* crtc = XRRGetCrtcInfo (g->display, res, output->crtc);
+					if(crtc) {
+						if(crtc->mode)
+							fprintf(monitor_layout_stream, "%i %i %i %i\n", crtc->width, crtc->height, crtc->x, crtc->y);
+						XRRFreeCrtcInfo(crtc);
+					}
+				}
+				XRRFreeOutputInfo(output);
+			}
+		}
+	}
+	XRRFreeScreenResources(res);
+	fclose(monitor_layout_stream);
+
+	if(!g->remote_monitor_layout || strcmp(monitor_layout, g->remote_monitor_layout))   {
+		if(g->remote_monitor_layout)
+			free(g->remote_monitor_layout);
+		g->remote_monitor_layout = monitor_layout;
+		monitor_layout = 0;
+		send_set_monitor_layout(g);
+	}
+
+	free(monitor_layout);
+}
+
+static void process_xevent_rrscreenchangenotify(Ghandles * g, const XRRScreenChangeNotifyEvent* ev ) {
+	XRRUpdateConfiguration((XEvent*)ev);
+
+	if(g->log_level > 1)
+		fprintf(stderr, "RRScreenChangeNotify\n");
+
+	reload(g);
+
+	update_monitor_layout(g);
 }
 
 /* dispatch local Xserver event */
@@ -1787,6 +1904,9 @@ static void process_xevent(Ghandles * g)
 		break;
 	default:;
 	}
+
+	if(event_buffer.type == (g->xrandr_event_base + RRScreenChangeNotify))
+		process_xevent_rrscreenchangenotify(g, (XRRScreenChangeNotifyEvent*)&event_buffer);
 }
 
 
@@ -3203,16 +3323,19 @@ int main(int argc, char **argv)
 	}
 	vchan_register_at_eof(restart_guid);
 
+	XRRSelectInput(ghandles.display, ghandles.root_win, RRScreenChangeNotifyMask);
+
 	get_protocol_version(&ghandles);
 	send_xconf(&ghandles);
+
+	update_monitor_layout(&ghandles);
 
 	for (;;) {
 		int select_fds[2] = { xfd };
 		fd_set retset;
 		int busy;
 		if (ghandles.reload_requested) {
-			fprintf(stderr, "reloading X server parameters...\n");
-			reload(&ghandles);
+			fprintf(stderr, "got request to reload X server parameters, now done automatically\n");
 			ghandles.reload_requested = 0;
 		}
 		do {
