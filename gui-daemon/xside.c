@@ -52,6 +52,7 @@
 #include <qubes-gui-protocol.h>
 #include <qubes-xorg-tray-defs.h>
 #include <libvchan.h>
+#include <glib.h>
 #include "txrx.h"
 #include "double-buffer.h"
 #include "list.h"
@@ -59,6 +60,29 @@
 #include "png.h"
 
 /* some configuration */
+
+/* position at which to auto place windows in the agent
+   we set Y to 24 so that tray icons, which are put at (0, 0), don't overlap with other windows
+*/
+#define WINDOW_DEFAULT_X 0
+#define WINDOW_DEFAULT_Y 24
+
+/* used to anonymize ourselves on non-exploited machines
+   must only contain common resolutions */
+static int screen_resolutions[] = {
+	1366, 768,
+	1920, 1080,
+	/* TODO: should we add one of these?
+	2560, 1440,
+	2880, 1800, // MacBook Pro
+	*/
+	3840, 2160,
+	0, 0
+};
+
+/* resolutions larger than the biggest one in screen_resolutions are multiple of this */
+static int large_screen_resolution_unit_w = 1920;
+static int large_screen_resolution_unit_h = 1080;
 
 /* default width of forced colorful border */
 #define BORDER_WIDTH 2
@@ -105,6 +129,7 @@ struct windowdata {
 	XID remote_winid;	/* window id on VM side */
 	XID untrusted_remote_transient_for;	/* transient_for hint for WM, see http://tronche.com/gui/x/icccm/sec-4.html#WM_TRANSIENT_FOR */
 	XID remote_parent;	/* parent window */
+	XID remote_ref_window;
 
 	/* window attributes on the host screen */
 	int width;
@@ -135,6 +160,8 @@ struct _global_handles {
 	Window root_win;	/* root attributes */
 	int root_width;		/* size of root window */
 	int root_height;
+	int remote_screen_width;
+	int remote_screen_height;
 	char* remote_monitor_layout;
 	GC context;		/* context for pixmap operations */
 	GC frame_gc;		/* graphic context to paint window frame */
@@ -201,6 +228,9 @@ struct _global_handles {
 	int use_kdialog;	/* use kdialog for prompts (default on KDE) or zenity (default on non-KDE) */
 	int audio_low_latency; /* set low-latency mode while starting pacat-simple-vchan */
 	int pointer_distance;
+	GTree* window_width_tree; /* we use these trees to find the max window width/height in O(log n) time */
+	GTree* window_height_tree;
+	int private_mode;
 };
 
 typedef struct _global_handles Ghandles;
@@ -252,14 +282,17 @@ static inline int sanitize_y(int untrusted_y)
 	return min(max(untrusted_y, -2 * MAX_WINDOW_HEIGHT), 2 * MAX_WINDOW_HEIGHT);
 }
 
-static inline int sanitize_window_width(Ghandles * UNUSED(g), int untrusted_width)
+/* in private mode, prevent VM from enlarging the monitor size by creating a large window */
+static inline int sanitize_window_width(Ghandles * g, int untrusted_width)
 {
-	return sanitize_width(untrusted_width);
+	int width = sanitize_width(untrusted_width);
+	return g->private_mode ? min(width, g->remote_screen_width - WINDOW_DEFAULT_X) : width;
 }
 
-static inline int sanitize_window_height(Ghandles* UNUSED(g), int untrusted_height)
+static inline int sanitize_window_height(Ghandles* g, int untrusted_height)
 {
-	return sanitize_height(untrusted_height);
+	int height = sanitize_height(untrusted_height);
+	return g->private_mode ? min(height, g->remote_screen_height - WINDOW_DEFAULT_Y) : height;
 }
 
 static struct windowdata* lookup_remote(Ghandles * g, Window win) {
@@ -271,6 +304,60 @@ static struct windowdata* lookup_remote(Ghandles * g, Window win) {
 		return 0;
 	return l->data;
 }
+
+static int ptrcmp_reverse(const void* a, const void* b)
+{
+	if(a < b)
+		return 1;
+	else if(a > b)
+		return -1;
+	else
+		return 0;
+}
+
+static void tree_inc_value(GTree* tree, void* key) {
+	g_tree_insert(tree, key, (void*)((uintptr_t)g_tree_lookup(tree, key) + 1));
+}
+
+static void tree_dec_value(GTree* tree, void* key) {
+	uintptr_t v = (uintptr_t)g_tree_lookup(tree, key);
+	if(v <= 1)
+		g_tree_remove(tree, key);
+	else
+		g_tree_insert(tree, key, (void*)(v - 1));
+}
+
+static gboolean tree_get_first_key_traverse_func(gpointer key, gpointer UNUSED(value), gpointer data)
+{
+	*(void**)data = key;
+	return TRUE;
+}
+
+static const void* tree_get_first_key(GTree* tree) {
+	const void* key = 0;
+	g_tree_foreach(tree, tree_get_first_key_traverse_func, &key);
+	return key;
+}
+
+static void set_window_size(Ghandles * g, struct windowdata *vm_window, int width, int height)
+{
+	if(width != vm_window->width) {
+		if(vm_window->width)
+			tree_dec_value(g->window_width_tree, (void*)(uintptr_t)vm_window->width);
+		if(width)
+			tree_inc_value(g->window_width_tree, (void*)(uintptr_t)width);
+		vm_window->width = width;
+	}
+
+	if(height != vm_window->height) {
+		if(vm_window->height)
+			tree_dec_value(g->window_height_tree, (void*)(uintptr_t)vm_window->height);
+		if(height)
+			tree_inc_value(g->window_height_tree, (void*)(uintptr_t)height);
+		vm_window->height = height;
+	}
+}
+
 
 static void inter_appviewer_lock(Ghandles *g, int mode);
 static void release_mapped_mfns(Ghandles * g, struct windowdata *vm_window);
@@ -541,6 +628,13 @@ static void mkghandles(Ghandles * g)
 	XGetWindowAttributes(g->display, g->root_win, &attr);
 	g->root_width = _VIRTUALX(attr.width);
 	g->root_height = attr.height;
+	if(!g->private_mode) {
+		g->remote_screen_width = g->root_width;
+		g->remote_screen_height = g->root_height;
+	} else {
+		g->remote_screen_width = screen_resolutions[0];
+		g->remote_screen_height = screen_resolutions[1];
+	}
 	g->context = XCreateGC(g->display, g->root_win, 0, NULL);
 	g->wmDeleteMessage =
 	    XInternAtom(g->display, "WM_DELETE_WINDOW", True);
@@ -572,10 +666,16 @@ static void mkghandles(Ghandles * g)
 	/* use qrexec for clipboard operations when stubdom GUI is used */
 	if (g->domid != g->target_domid)
 		g->qrexec_clipboard = 1;
+	/* disable private mode for HVM domains since SetMonitorLayout hangs
+       and the Win7 tools don't properly redirect windows */
+	if (g->qrexec_clipboard)
+		g->private_mode = 0;
 	if (getenv("KDE_SESSION_UID"))
 		g->use_kdialog = 1;
 	else
 		g->use_kdialog = 0;
+	g->window_width_tree = g_tree_new(ptrcmp_reverse);
+	g->window_height_tree = g_tree_new(ptrcmp_reverse);
 
 	g->icon_data = NULL;
 	g->icon_data_len = 0;
@@ -1116,9 +1216,79 @@ static int send_configure(Ghandles * g, struct windowdata *vm_window)
 	return 1;
 }
 
+static void get_untrusted_remote_screen_xy(Ghandles* g, struct windowdata *vm_window, int* px, int* py)
+{
+	int x = 0;
+	int y = 0;
+	for(; vm_window; vm_window = lookup_remote(g, vm_window->remote_parent)) {
+		x += vm_window->untrusted_remote_x;
+		y += vm_window->untrusted_remote_y;
+	}
+	*px = x;
+	*py = y;
+}
+
+static void clip_coordinate(int* c, int size, int limit, int have_pointer, int pointer, int have_align_transient, int transient_for_x, int transient_for_size) {
+	if(size > limit)
+		abort();
+
+	if(*c < 0) {
+		/* try to align to override-redirect transient (the menu that caused this submenu to open) */
+		if(have_align_transient && transient_for_x >= size && transient_for_x <= limit)
+			*c = transient_for_x - size;
+		else if(have_align_transient && (transient_for_x + transient_for_size) >= size && (transient_for_x + transient_for_size + size) <= limit)
+			*c = transient_for_x + transient_for_size;
+		/* try to position the edge where the pointer is, on the closest side,
+		   then on the farther one and otherwise align to the window edge */
+		else if(have_pointer && pointer >= size && pointer <= limit)
+			*c = pointer - size;
+		else if(have_pointer && pointer >= 0 && (pointer + size) <= limit)
+			*c = pointer;
+		/* else just clip to edge */
+		else
+			*c = 0;
+	} else if((*c + size) > limit) {
+		/* flip everything and use the code above */
+		*c = limit - *c - size;
+		pointer = limit - pointer;
+		transient_for_x = limit - transient_for_x - transient_for_size;
+
+		clip_coordinate(c, size, limit, have_pointer, pointer, have_align_transient, transient_for_x, transient_for_size);
+
+		*c = limit - *c - size;
+	}
+}
+
+/* TODO: is there a way of getting this information with 1 roundtrip and no race conditions? */
+static Window get_pointer_window(Display* dpy, Window start_win) {
+	Window root, child;
+	int pointer_x, pointer_y, root_pointer_x, root_pointer_y;
+	unsigned mask;
+	Window prev_win = 0;
+
+	for(;;) {
+		Window win = start_win;
+		for(;;) {
+			if(!XQueryPointer(dpy, win, &root, &child, &root_pointer_x, &root_pointer_y, &pointer_x, &pointer_y, &mask))
+				return 0;
+			if(!child || win == child)
+				break;
+			win = child;
+		}
+		/* only return when we get the same window twice to try to work around race conditions */
+		if(win == prev_win)
+			return win;
+		prev_win = win;
+	}
+}
+
+
 static void update_local(Ghandles * g, struct windowdata *vm_window, int remote_moved, int remote_resized, int remote_override_redirect_changed, int remote_transient_for_changed, int apply)
 {
 	struct windowdata *transient_for = lookup_remote(g, vm_window->untrusted_remote_transient_for);
+
+	/* window to use as reference to translate coordinates */
+	struct windowdata *ref_window = lookup_remote(g, vm_window->remote_ref_window);
 
 	struct windowdata* parent = lookup_remote(g, vm_window->remote_parent);
 	int moved;
@@ -1133,8 +1303,24 @@ static void update_local(Ghandles * g, struct windowdata *vm_window, int remote_
 
 	override_redirect = vm_window->is_docked ? 0 : !!vm_window->untrusted_remote_override_redirect;
 
+	if(!ref_window && override_redirect && g->last_input_window && g->last_input_window->is_docked) {
+		/* fix programs that popup menus on tray icons with transient_for set to the main window */
+		ref_window = g->last_input_window;
+	}
+
+	if(!ref_window && transient_for)
+		ref_window = transient_for;
+
+	if(!ref_window && override_redirect) {
+		/* the GTK menu implementation allows to create popup meus without transient_for,
+		   so use the last input window and hope for the best */
+		ref_window = g->last_input_window;
+	}
+
+	vm_window->remote_ref_window = ref_window ? ref_window->remote_winid : 0;
+
 	if(g->log_level > 1)
-		fprintf(stderr, "update_local start for local 0x%x remote 0x%x: was (%i, %i) %ix%i override=%u is_mapped=%u remote%s%s%s%s (%i, %i) %ix%i override=%u is_mapped=%u transient_for local 0x%x remote 0x%x parent local 0x%x remote 0x%x\n",
+		fprintf(stderr, "update_local start for local 0x%x remote 0x%x: was (%i, %i) %ix%i override=%u is_mapped=%u remote%s%s%s%s (%i, %i) %ix%i override=%u is_mapped=%u transient_for local 0x%x remote 0x%x ref_window local 0x%x remote 0x%x parent local 0x%x remote 0x%x\n",
 		    (int)vm_window->local_winid, (int)vm_window->remote_winid,
 			vm_window->x, vm_window->y,
 			vm_window->width, vm_window->height,
@@ -1146,6 +1332,7 @@ static void update_local(Ghandles * g, struct windowdata *vm_window, int remote_
 			vm_window->untrusted_remote_override_redirect,
 			vm_window->remote_is_mapped,
 			transient_for ? (int)transient_for->local_winid : 0, (int)vm_window->untrusted_remote_transient_for,
+			ref_window ? (int)ref_window->local_winid : 0, ref_window ? (int)ref_window->remote_winid : 0,
 			parent ? (int)parent->local_winid : 0, parent ? (int)parent->remote_winid : 0);
 
 	/* We do not allow a docked window to change its size or redirection, period. */
@@ -1157,7 +1344,7 @@ static void update_local(Ghandles * g, struct windowdata *vm_window, int remote_
 
 	if(vm_window->is_docked) {
 		/* nothing */
-	} else if(!parent) {
+	} else if(parent) {
 		/* just pass child windows through */
 		if(remote_moved) {
 			x = sanitize_x(vm_window->untrusted_remote_x);
@@ -1172,7 +1359,217 @@ static void update_local(Ghandles * g, struct windowdata *vm_window, int remote_
 		/* hack to fix the GTK menu implementation that creates a visible offscreen window */
 		x = -MAX_WINDOW_WIDTH;
 		y = -MAX_WINDOW_HEIGHT;
-	} else if(!vm_window->untrusted_remote_override_redirect && !(vm_window->untrusted_remote_size_hint_flags & (PPosition | USPosition))) {
+	} else if(g->private_mode && ref_window) {
+		/* place relative to an existing window */
+
+		Window root, child;
+		int pointer_x, pointer_y, root_pointer_x, root_pointer_y;
+		int clip_width, clip_height;
+		unsigned mask;
+		int have_pointer;
+
+		int avoid = 0;
+		int avoid_x = 0, avoid_y = 0, avoid_width = 0, avoid_height = 0;
+
+		int old_offset_x, old_offset_y;
+		int offset_x, offset_y;
+		struct windowdata *clip_window = ref_window;
+
+		/* find a good window to clip our window to */
+		for(;;) {
+			struct windowdata* next;
+			if(clip_window->is_docked)
+				break;
+			else if((next = lookup_remote(g, clip_window->remote_parent)))
+				clip_window = next;
+			else if((next = lookup_remote(g, clip_window->remote_ref_window)) || (next = lookup_remote(g, clip_window->untrusted_remote_transient_for))) {
+				/* go up from unredirected window only if the upper window fully contains this window */
+				if(!clip_window->override_redirect && (clip_window->x < next->x || clip_window->y < next->y || (clip_window->x + (int)clip_window->width) > (next->x + (int)next->width) || (clip_window->y + (int)clip_window->height) > (next->y + (int)next->height)))
+					break;
+				clip_window = next;
+			}
+			else
+				break;
+		}
+
+		clip_width = (int)clip_window->width;
+		clip_height = (int)clip_window->height;
+
+		have_pointer = XQueryPointer(g->display, clip_window->local_winid, &root, &child, &root_pointer_x, &root_pointer_y, &pointer_x, &pointer_y, &mask);
+
+		if(width > clip_width || height > clip_height) {
+			Window pointer_window;
+			int own_pointer = pointer_x >= 0 && pointer_y >= 0 && pointer_x < clip_width && pointer_y < clip_height &&
+				(pointer_window = get_pointer_window(g->display, g->root_win)) && list_lookup(g->wid2windowdata, pointer_window);
+			int old_clip_width = clip_width;
+			int old_clip_height = clip_height;
+			struct windowdata* old_clip_window = clip_window;
+
+			/* clip popups from docked windows to the screen, so that they don't fall off the screen
+			   TODO: these checks prevent keyboard-only access to tray windows, is that needed?
+			*/
+			if(override_redirect && clip_window->is_docked && own_pointer) {
+				XWindowAttributes attr;
+				XGetWindowAttributes(g->display, g->root_win, &attr);
+				clip_window = 0;
+				clip_width = attr.width;
+				clip_height = attr.height;
+
+				have_pointer = XQueryPointer(g->display, g->root_win, &root, &child, &root_pointer_x, &root_pointer_y, &pointer_x, &pointer_y, &mask);
+
+				/* avoid the tray icon so the user has a chance to not interact with the popup and leak its orientation */
+				if(XTranslateCoordinates(g->display, old_clip_window->local_winid, g->root_win, 0, 0, &avoid_x, &avoid_y, &child)) {
+					avoid = 1;
+					avoid_width = old_clip_width;
+					avoid_height = old_clip_height;
+				}
+			}
+
+			if(!own_pointer) {
+				avoid = 1;
+				avoid_x = pointer_x - g->pointer_distance;
+				avoid_y = pointer_y - g->pointer_distance;
+				avoid_width = 1 + g->pointer_distance * 2;
+				avoid_height = 1 + g->pointer_distance * 2;
+			}
+
+			if(g->log_level > 1)
+				fprintf(stderr, "update_local ref doesn't fit for local 0x%x remote 0x%x %ix%i > %ix%i clip_window local 0x%x remote 0x%x to_screen=%i avoid=%i own_pointer=%i\n",
+			    (int)vm_window->local_winid, (int)vm_window->remote_winid,
+				width, height, old_clip_width, old_clip_height, (int)old_clip_window->local_winid, (int)old_clip_window->remote_winid, !clip_window, avoid, own_pointer);
+		}
+
+		if(parent == clip_window)
+			old_offset_x = old_offset_y = 0;
+		else if(!XTranslateCoordinates(g->display, parent ? parent->local_winid : g->root_win, clip_window ? clip_window->local_winid : g->root_win, 0, 0, &old_offset_x, &old_offset_y, &child))
+			goto unconstrained;
+
+		old_offset_x += vm_window->x;
+		old_offset_y += vm_window->y;
+		offset_x = old_offset_x;
+		offset_y = old_offset_y;
+
+		/* start placing the window as requested */
+		if(!override_redirect && !(vm_window->untrusted_remote_size_hint_flags & (PPosition | USPosition))) {
+			offset_x = (int)(clip_width - width) >> 1;
+			offset_y = (int)(clip_height - height) >> 1;
+
+			if(g->log_level > 1)
+				fprintf(stderr, "update_local ref autoplace for local 0x%x remote 0x%x (%i, %i)\n",
+			    (int)vm_window->local_winid, (int)vm_window->remote_winid,
+				offset_x, offset_y);
+		} else {
+			int untrusted_offset_x;
+			int untrusted_offset_y;
+			int untrusted_x, untrusted_y;
+
+			/* translate coordinates using a mapping that maps remote ref_window to local ref_window */
+			get_untrusted_remote_screen_xy(g, parent, &untrusted_x, &untrusted_y);
+			untrusted_offset_x = untrusted_x + vm_window->untrusted_remote_x;
+			untrusted_offset_y = untrusted_y + vm_window->untrusted_remote_y;
+
+			get_untrusted_remote_screen_xy(g, ref_window, &untrusted_x, &untrusted_y);
+			untrusted_offset_x -= untrusted_x;
+			untrusted_offset_y -= untrusted_y;
+
+			if(clip_window == ref_window)
+				offset_x = offset_y = 0;
+			else if(!XTranslateCoordinates(g->display, ref_window->local_winid, clip_window ? clip_window->local_winid : g->root_win, 0, 0, &offset_x, &offset_y, &child))
+				goto unconstrained;
+
+			offset_x += sanitize_x(untrusted_offset_x);
+			offset_y += sanitize_y(untrusted_offset_y);
+
+			if(g->log_level > 1)
+				fprintf(stderr, "update_local ref place for local 0x%x remote 0x%x (%i, %i)\n",
+			    (int)vm_window->local_winid, (int)vm_window->remote_winid,
+				offset_x, offset_y);
+		}
+
+		/* if it fits in the clip window, clip it to it */
+		if(width <= clip_width && height <= clip_height) {
+			int transient_for_x = 0;
+			int transient_for_y = 0;
+			int have_align_transient = 0;
+
+			have_align_transient = transient_for && transient_for != clip_window && transient_for->override_redirect && override_redirect &&
+				XTranslateCoordinates(g->display, transient_for->local_winid, clip_window ? clip_window->local_winid : g->root_win, 0, 0, &transient_for_x, &transient_for_y, &child);
+
+			clip_coordinate(&offset_x, (int)width, (int)clip_width, have_pointer, pointer_x, have_align_transient, transient_for_x, transient_for ? transient_for->width : 0);
+			clip_coordinate(&offset_y, (int)height, (int)clip_height, have_pointer, pointer_y, have_align_transient, transient_for_y, transient_for ? transient_for->height : 0);
+
+			if(g->log_level > 1)
+				fprintf(stderr, "update_local clip for local 0x%x remote 0x%x have_align_transient=%i\n",
+			    (int)vm_window->local_winid, (int)vm_window->remote_winid,
+				have_align_transient);
+		}
+
+		/* avoid the pointer if we are not clipping to a window and don't own the pointer, or if we are clipping to the screen */
+		if(avoid && (offset_x < (avoid_x + avoid_width) && offset_y < (avoid_y + avoid_height) && avoid_x < (offset_x + width) && avoid_y < (offset_y + height))) {
+			/* choose the direction to move the window in: choose one pointing towards the clip window,
+			   on the axis where the distance to the closest edge is greater */
+			int d_left = avoid_x - clip_width;
+			int d_right = -(avoid_x + avoid_width);
+			int d_up = avoid_y - clip_height;
+			int d_down = -(avoid_y + avoid_height);
+			int d_max = max(max(d_left, d_right), max(d_up, d_down));
+
+			if(g->log_level > 1)
+				fprintf(stderr, "update_local avoid pointer for local 0x%x remote 0x%x: %i %i %i %i\n",
+			    (int)vm_window->local_winid, (int)vm_window->remote_winid,
+				d_left, d_right, d_up, d_down);
+
+			if(d_down == d_max)
+				offset_y = avoid_y + avoid_height;
+			else if(d_right == d_max)
+				offset_x = avoid_x + avoid_width;
+			else if(d_left == d_max)
+				offset_x = avoid_x - width;
+			else if(d_up == d_max)
+				offset_y = avoid_y - height;
+			else
+				abort();
+		}
+
+	    /* don't allow to create a window that completely contains the clip window to avoid spoofing */
+		if(clip_window && offset_x < 0 && offset_y < 0 && (offset_x + (int)width) > (int)clip_width && (offset_y + (int)height) > (int)clip_height) {
+			if(!avoid)
+				offset_y = pointer_y;
+			else
+				offset_y = clip_height >> 1;
+
+			if(g->log_level > 1)
+				fprintf(stderr, "update_local prevent contained for local 0x%x remote 0x%x avoid=%i\n",
+			    (int)vm_window->local_winid, (int)vm_window->remote_winid,
+				avoid);
+		}
+
+		/*
+		if((offset_x + (int)width) < 0 || (offset_y + (int)height) < 0 || offset_x > (int)clip_width || offset_y > (int)clip_height) {
+			// if we are creating a window not overlapping or touching the clip window, disable override redirect
+			override_redirect = 0;
+		}
+		*/
+
+		if(offset_x != old_offset_x || offset_y != old_offset_y)
+		{
+			int base_x;
+			int base_y;
+			if(clip_window == parent)
+				base_x = base_y = 0;
+			else if(!XTranslateCoordinates(g->display, clip_window ? clip_window->local_winid : g->root_win, parent ? parent->local_winid : g->root_win, 0, 0, &base_x, &base_y, &child))
+				goto unconstrained;
+
+			x = base_x + offset_x;
+			y = base_y + offset_y;
+		}
+
+		if(g->log_level > 1)
+			fprintf(stderr, "update_local ref for local 0x%x remote 0x%x: (%i, %i) = (%i, %i) + (%i, %i) was (%i, %i) clip_window local 0x%x remote 0x%x\n",
+		    (int)vm_window->local_winid, (int)vm_window->remote_winid,
+			x, y, x - offset_x, y - offset_y, offset_x, offset_y, old_offset_x, old_offset_y,
+			clip_window ? (int)clip_window->local_winid : 0, clip_window ? (int)clip_window->remote_winid : 0);
+	} else if(g->private_mode || (!vm_window->untrusted_remote_override_redirect && !(vm_window->untrusted_remote_size_hint_flags & (PPosition | USPosition)))) {
 		/* place unconstrained window */
 
 		int pointer_x, pointer_y, root_pointer_x, root_pointer_y;
@@ -1180,6 +1577,7 @@ static void update_local(Ghandles * g, struct windowdata *vm_window, int remote_
 		unsigned mask;
 		int have_pointer;
 
+unconstrained:
 		have_pointer = XQueryPointer(g->display, g->root_win, &root, &child, &root_pointer_x, &root_pointer_y, &pointer_x, &pointer_y, &mask);
 
 		XWindowAttributes attr;
@@ -1187,8 +1585,8 @@ static void update_local(Ghandles * g, struct windowdata *vm_window, int remote_
 
 		if(!vm_window->is_mapped) {
 			/* center the window */
-			x = (attr.width - width) >> 1;
-			y = max(0, (attr.height - height) >> 1);
+			x = (g->root_width - width) >> 1;
+			y = max(0, (g->root_height - height) >> 1);
 		}
 
 		/* make sure we don't steal input events by disallowing overlap with the cursor */
@@ -1208,6 +1606,9 @@ static void update_local(Ghandles * g, struct windowdata *vm_window, int remote_
 				x = root_pointer_x - width - g->pointer_distance;
 		}
 
+		if(g->log_level > 1)
+			fprintf(stderr, "update_local top-level\n");
+
 		/* don't allow to override redirect top level windows */
 		override_redirect = 0;
 	} else {
@@ -1221,7 +1622,7 @@ static void update_local(Ghandles * g, struct windowdata *vm_window, int remote_
 	transient_for_changed = remote_transient_for_changed;
 
 	if(g->log_level > 1)
-		fprintf(stderr, "update_local end for local 0x%x remote 0x%x: (%i, %i) %ix%i override=%u %s%s%s%s\n",
+		fprintf(stderr, "update_local end for local 0x%x remote 0x%x: (%i, %i) %ix%i override=%u%s%s%s%s\n",
 		    (int)vm_window->local_winid, (int)vm_window->remote_winid,
 			x, y,
 			width, height,
@@ -1232,10 +1633,8 @@ static void update_local(Ghandles * g, struct windowdata *vm_window, int remote_
 		vm_window->x = x;
 		vm_window->y = y;
 	}
-	if(resized) {
-		vm_window->width = width;
-		vm_window->height = height;
-	}
+	if(resized)
+		set_window_size(g, vm_window, width, height);
 	if(override_redirect_changed)
 		vm_window->override_redirect = override_redirect;
 
@@ -1287,15 +1686,38 @@ static int update_remote(Ghandles * g, struct windowdata *vm_window)
 	int untrusted_remote_x;
 	int untrusted_remote_y;
 
-	untrusted_remote_x = vm_window->untrusted_remote_x;
-	untrusted_remote_y = vm_window->untrusted_remote_y;
-	if(vm_window->is_docked) {
-        /* docked window is reparented to root_win on vmside */
-	    Window win;
-	    XTranslateCoordinates(g->display, vm_window->local_winid, g->root_win, 0, 0, &untrusted_remote_x, &untrusted_remote_y, &win);
+	if(!g->private_mode) {
+		untrusted_remote_x = vm_window->untrusted_remote_x;
+		untrusted_remote_y = vm_window->untrusted_remote_y;
+		if(vm_window->is_docked) {
+	        /* docked window is reparented to root_win on vmside */
+		    Window win;
+		    XTranslateCoordinates(g->display, vm_window->local_winid, g->root_win, 0, 0, &untrusted_remote_x, &untrusted_remote_y, &win);
+		} else {
+			untrusted_remote_x = vm_window->x;
+			untrusted_remote_y = vm_window->y;
+		}
 	} else {
-		untrusted_remote_x = vm_window->x;
-		untrusted_remote_y = vm_window->y;
+		if(vm_window->is_docked) {
+			untrusted_remote_x = 0;
+			untrusted_remote_y = 0;
+		} else if(vm_window->remote_is_mapped && !lookup_remote(g, vm_window->remote_parent) && (
+			(!lookup_remote(g, vm_window->untrusted_remote_transient_for) && !lookup_remote(g, vm_window->remote_ref_window)) || (!vm_window->untrusted_remote_override_redirect && !(vm_window->untrusted_remote_size_hint_flags & (PPosition | USPosition)))
+		)) {
+			/* simulate window manager automatically placing the window
+
+		       move top-level windows placed at (0, 0) to (0, 20) to have a realistic value
+			   given that most systems have titlebars and so that we can assume that
+			   (0, 0) always means "automatic positioning" rather than "at top left corner of window X"
+
+				TODO: is this the place to do this? or should we do this on map?
+			 */
+			untrusted_remote_x = WINDOW_DEFAULT_X;
+			untrusted_remote_y = WINDOW_DEFAULT_Y;
+		} else {
+			untrusted_remote_x = vm_window->untrusted_remote_x;
+			untrusted_remote_y = vm_window->untrusted_remote_y;
+		}
 	}
 
 	if(untrusted_remote_x == vm_window->untrusted_remote_x && untrusted_remote_y == vm_window->untrusted_remote_y &&
@@ -1363,6 +1785,52 @@ static int send_set_monitor_layout(Ghandles* g)
 	return WEXITSTATUS(status) == 0;
 }
 
+static void update_remote_screen(Ghandles* g)
+{
+	int rsw;
+	int rsh;
+	int w, h;
+	int i;
+
+	if(!g->private_mode)
+		return;
+
+	w = (int)(intptr_t)tree_get_first_key(g->window_width_tree) + WINDOW_DEFAULT_X;
+	h = (int)(intptr_t)tree_get_first_key(g->window_height_tree) + WINDOW_DEFAULT_Y;
+
+	for(i = 0; screen_resolutions[i]; i += 2) {
+		rsw = screen_resolutions[i];
+		rsh = screen_resolutions[i + 1];
+
+		if(w <= rsw && h <= rsh)
+			break;
+	}
+
+	if(!screen_resolutions[i]) {
+		/* we mostly give up trying to blend in with non-Qubes users here,
+		   and just try to reduce the the number of notifications we have to send,
+		   try to fit in video RAM and still send plausible multi-monitor configuration sizes
+	    */
+
+		rsw = ((w ? ((w - 1) / large_screen_resolution_unit_w) : 0) + 1) * large_screen_resolution_unit_w;
+		if(rsw < w)
+			rsw = w;
+		rsh = ((h ? ((h - 1) / large_screen_resolution_unit_h) : 0) + 1) * large_screen_resolution_unit_h;
+		if(rsh < h)
+			rsh = h;
+	}
+
+	if(rsw != g->remote_screen_width || rsh != g->remote_screen_height) {
+		g->remote_screen_width = rsw;
+		g->remote_screen_height = rsh;
+		if(g->remote_monitor_layout)
+			free(g->remote_monitor_layout);
+		asprintf(&g->remote_monitor_layout, "%u %u 0 0\n", g->remote_screen_width, g->remote_screen_height);
+
+		send_set_monitor_layout(g);
+	}
+}
+
 /* handle local Xserver event: XConfigureEvent
  * after some checks/fixes send to relevant window in VM */
 static void process_xevent_configure(Ghandles * g, const XConfigureEvent * ev)
@@ -1408,9 +1876,9 @@ static void process_xevent_configure(Ghandles * g, const XConfigureEvent * ev)
 	    && vm_window->height == ev->height && vm_window->x == x
 	    && vm_window->y == y)
 		return;
+	set_window_size(g, vm_window, ev->width, ev->height);
+	update_remote_screen(g);
 
-	vm_window->width = ev->width;
-	vm_window->height = ev->height;
 	vm_window->x = x;
 	vm_window->y = y;
 
@@ -1932,6 +2400,12 @@ static void update_monitor_layout(Ghandles * g) {
 	FILE* monitor_layout_stream;
 	XRRScreenResources* res;
 
+	if(g->private_mode)
+		return;
+
+	g->remote_screen_width = g->root_width;
+	g->remote_screen_height = g->root_height;
+
 	monitor_layout_stream = open_memstream(&monitor_layout, &monitor_layout_size);
 	res = XRRGetScreenResources (g->display, g->root_win);
 	for(i = 0; i < res->noutput; ++i) {
@@ -2117,6 +2591,7 @@ static void handle_create(Ghandles * g, XID window)
 	else
 		vm_window->remote_parent = 0;
 	vm_window->untrusted_remote_transient_for = 0;
+	vm_window->remote_ref_window = 0;
 
 	update_local(g, vm_window, 1, 1, 0, 0, 0);
 
@@ -2156,6 +2631,8 @@ static void handle_destroy(Ghandles * g, struct genlist *l)
 	list_remove(l2);
 	if (vm_window == g->screen_window)
 		g->screen_window = NULL;
+	/* remove the window from the max width/height data structures */
+	set_window_size(g, vm_window, 0, 0);
 	free(vm_window);
 }
 
@@ -2494,6 +2971,7 @@ static void handle_map(Ghandles * g, struct windowdata *vm_window)
 static void handle_unmap(Ghandles * g, struct windowdata *vm_window)
 {
 	vm_window->remote_is_mapped = 0;
+	vm_window->remote_ref_window = 0;
 	vm_window->is_mapped = 0;
 	(void) XUnmapWindow(g->display, vm_window->local_winid);
 }
@@ -2845,9 +3323,15 @@ static void send_xconf(Ghandles * g)
 	struct msg_xconf xconf;
 	XWindowAttributes attr;
 	XGetWindowAttributes(g->display, g->root_win, &attr);
-	xconf.w = _VIRTUALX(attr.width);
-	xconf.h = attr.height;
-	xconf.depth = attr.depth;
+	if(!g->private_mode) {
+		xconf.w = _VIRTUALX(attr.width);
+		xconf.h = attr.height;
+		xconf.depth = attr.depth;
+	} else {
+		xconf.w = g->remote_screen_width;
+		xconf.h = g->remote_screen_height;
+		xconf.depth = 24;
+	}
 	xconf.mem = xconf.w * xconf.h * 4 / 1024 + 1;
 	write_struct(g->vchan, xconf);
 }
@@ -3058,6 +3542,7 @@ static void load_default_config_values(Ghandles * g)
 	g->paste_seq_key = XK_v;
 	g->allow_fullscreen = 0;
 	g->startup_timeout = 45;
+	g->private_mode = 1;
 }
 
 // parse string describing key sequence like Ctrl-Alt-c
