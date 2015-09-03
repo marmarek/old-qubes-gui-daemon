@@ -143,6 +143,7 @@ struct _global_handles {
 	Atom wm_state_fullscreen; /* Atom: _NET_WM_STATE_FULLSCREEN */
 	Atom wm_state_demands_attention; /* Atom: _NET_WM_STATE_DEMANDS_ATTENTION */
 	Atom wm_state_hidden;	/* Atom: _NET_WM_STATE_HIDDEN */
+	Atom wm_user_time;  /* Atom: _NET_WM_USER_TIME */
 	Atom frame_extents; /* Atom: _NET_FRAME_EXTENTS */
 	/* shared memory handling */
 	struct shm_cmd *shmcmd;	/* shared memory with Xorg */
@@ -376,6 +377,7 @@ static Window mkwindow(Ghandles * g, struct windowdata *vm_window)
 	Window parent;
 	XSizeHints my_size_hints;	/* hints for the window manager */
 	Atom atom_label;
+	int user_time = 0;
 
 	my_size_hints.flags = PSize;
 	my_size_hints.width = vm_window->width;
@@ -440,6 +442,12 @@ static Window mkwindow(Ghandles * g, struct windowdata *vm_window)
 			(const unsigned char *)&vm_window->remote_winid,
 			1);
 
+	// prevent focus stealing
+	XChangeProperty(g->display, child_win, g->wm_user_time, XA_CARDINAL,
+			32, PropModeReplace,
+			(const unsigned char *)&user_time,
+			1);
+
 	if (vm_window->remote_winid == FULLSCREEN_WINDOW_ID) {
 		/* whole screen window */
 		g->screen_window = vm_window;
@@ -489,6 +497,7 @@ static void mkghandles(Ghandles * g)
 	g->wm_state_fullscreen = XInternAtom(g->display, "_NET_WM_STATE_FULLSCREEN", False);
 	g->wm_state_demands_attention = XInternAtom(g->display, "_NET_WM_STATE_DEMANDS_ATTENTION", False);
 	g->wm_state_hidden = XInternAtom(g->display, "_NET_WM_STATE_HIDDEN", False);
+	g->wm_user_time = XInternAtom(g->display, "_NET_WM_USER_TIME", False);
 	g->frame_extents = XInternAtom(g->display, "_NET_FRAME_EXTENTS", False);
 	/* create graphical contexts */
 	get_frame_gc(g, g->cmdline_color ? : "red");
