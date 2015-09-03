@@ -1745,6 +1745,10 @@ static int send_set_monitor_layout(Ghandles* g)
 	char domid_str[16];
 	char* args[] = {"qrexec-client", "-d", domid_str, "DEFAULT:QUBESRPC qubes.SetMonitorLayout dom0", 0};
 
+	// HACK: the qrexec-client process seems to hang for HVMs, just skip it for now
+	if(g->qrexec_clipboard)
+		return 1;
+
 	snprintf(domid_str, sizeof(domid_str), "%d", g->target_domid);
 
 	fprintf(stderr, "send_set_monitor_layout %s", g->remote_monitor_layout);
